@@ -157,6 +157,16 @@ fi
 rm -rf root
 mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
 cp obj/init root/sbin/init
+# The kernel runs /sbin/launchd as process 1.  In the boot volume of a boot off the flash
+# (FLASHBOOT=1) that is stage0, which mounts this image on /redwood and runs its init; when this
+# image is the boot volume itself (the A32 served image, which has no second RAM disk), the
+# kernel's process 1 has to be this init.
+cp obj/init root/sbin/launchd
+# Where init mounts the two cryptexes once the iOS volume is the root and this image is what the
+# boot volume became, /private/preboot (boot-arg root_apfs=, src/init.c: mount_cryptex).  The RAM
+# boot volume carries the same pair (flashboot.apfs); these are for when this image is the boot
+# volume itself, as in the A32 served image.
+mkdir -p root/Cryptexes/OS root/Cryptexes/App
 cp obj/child root/bin/child
 # The data volume into the flash and back (src/var_store.c), and the job that saves it when a run
 # ends: the program and its job together, away from the iOS job list below, which several working

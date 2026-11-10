@@ -1,0 +1,24 @@
+[Defines]
+  INF_VERSION   = 0x00010005
+  BASE_NAME     = A32MemoryMapDxeLib
+  FILE_GUID     = a8a42d65-ce17-4cb5-913b-283578f10b56
+  MODULE_TYPE   = BASE
+  VERSION_STRING = 1.0
+  LIBRARY_CLASS = MemoryMapLib
+
+[Sources]
+  MemoryMapDxeLib.c
+  ../MemoryMapLib/A32MemoryMapHob.c
+
+[Packages]
+  ArmPkg/ArmPkg.dec
+  MdePkg/MdePkg.dec
+  SiliciumPkg/SiliciumPkg.dec
+  a32Pkg/a32.dec
+
+[LibraryClasses]
+  BaseMemoryLib
+  HobLib
+
+[Guids]
+  gA32MemoryMapHobGuid

@@ -35,11 +35,20 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define PAGE_SIZE_MAX       0x4000ULL
 
 #define LOG_PARTITION       u"logdump"
+#define CHECKPOINT_ENTRY 1      /* first cold-boot assembly checkpoint; no root disk needed */
+#define CHECKPOINT_UEFI_HOLD 998
 #define CHECKPOINT_SELFTEST 999
 #define PANIC_LOG_SIZE      0x80000u
 #define NVRAM_BANK_SIZE     0x2000u
 #define PANIC_LOG_BASE      (PAYLOAD_BASE + PAYLOAD_MAX_SIZE - 0x100000ULL)
 #define PAYLOAD_MAX_SIZE    0x04000000ULL         /* RAM reserved for the payload in the UEFI memory map */
+
+/* A32 starts from a filesystem; no preloaded physical address may be probed.
+ * Other builds retain the boot-shim/QEMU preloaded-memory contract. */
+#ifndef A32_VOLUME_FIRST
+#define A32_VOLUME_FIRST 0
+#endif
+static int payload_readable = !A32_VOLUME_FIRST;
 
 /* ------------------------------------------------------------------------ */
 /* XNU structures (pexpert/pexpert/arm64/boot.h, mach-o/loader.h)           */
@@ -578,6 +587,14 @@ static const struct platform platform_redwood = {
 	 * (XNU's machine_routines.c, ml_choose_slow_core_partners()).
 	 */
 	.small_cores = 0x0f,
+};
+
+/* SM-A325F stock A325FXXSCDXL2 DTB, revision-4 overlay. Firmware still has
+ * to supply a safe memory map and GOP before this profile can boot XNU. */
+static const struct platform platform_a32 = {
+	.name = "a32", .io_base = 0x0C000000, .io_size = 0x10000000,
+	.gic_dist = 0x0C000000, .gic_redist = 0x0C040000,
+	.cores = 1, .core_shift = 0,
 };
 
 /* ------------------------------------------------------------------------ */
@@ -1503,6 +1520,7 @@ ufs_survey(void)
 #define BLOCK_MAX_PARTS    160
 #define BLOCK_MAX_UNITS    16
 #define BLOCK_PART_UNIT    1u                          /* the entry is a whole logical unit, not a partition */
+#define BLOCK_PART_FILE    2u                          /* the entry is a file served as a block device, read only */
 #define BLOCK_OP_READ      0u
 #define BLOCK_OP_WRITE     1u
 
@@ -1601,6 +1619,10 @@ static struct loader_block block_shared __attribute__((aligned(0x2000)));
 static void block_io2_probe(efi_handle h, efi_block_io *bio);
 static int block_probe_requested;       /* ufs_probe=1: block_io2_probe() at block_start() */
 static efi_block_io *block_bios[BLOCK_MAX_PARTS];
+/* the file-backed partition: system.apfs served from a UEFI volume, never a real block device */
+static efi_file *block_file;
+static efi_file *block_file_root;
+static uint64_t block_file_size;
 static int block_enabled;
 static int block_write_requested;       /* ufs_write=1 on the command line */
 static int block_write_part = -1;       /* the only partition a write may reach; -1: none, writes refused */
@@ -1891,6 +1913,72 @@ block_is_darwin(const efi_partition_info *info, const efi_block_io *bio, const s
 	return 1;
 }
 
+/*
+ * system.apfs as a partition of its own: the loader serves its blocks out of the file instead of
+ * copying the whole container into RAM.  Read only.  The GPT walk that finds the phone's own
+ * partitions is not involved; this entry is added after it, and nothing here touches a controller.
+ */
+static int
+block_add_file_part(void)
+{
+	static const efi_guid fs_guid = EFI_SIMPLE_FILE_SYSTEM_GUID, info_guid = EFI_FILE_INFO_GUID;
+	static const char16 path[] = u"\\EFI\\hakios\\system.apfs";
+	efi_handle *handles = NULL;
+	uint64_t count = 0, size = 0, info_size;
+	uint8_t info[512] __attribute__((aligned(8)));
+	int added = 0;
+
+	if (block_shared.parts >= BLOCK_MAX_PARTS ||
+	    EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &fs_guid, NULL, &count, &handles)) || handles == NULL) {
+		return 0;
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_simple_fs *fs = NULL;
+		efi_file *root = NULL, *file = NULL;
+		struct loader_block_part *bp;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &fs_guid, (void **)&fs)) || fs == NULL ||
+		    EFI_ERROR(fs->open_volume(fs, &root)) || root == NULL) {
+			continue;
+		}
+		if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
+			root->close(root);
+			continue;
+		}
+		info_size = sizeof(info);
+		if (EFI_ERROR(file->get_info(file, &info_guid, &info_size, info)) ||
+		    info_size < EFI_FILE_INFO_FILE_SIZE_OFFSET + sizeof(uint64_t)) {
+			file->close(file);
+			root->close(root);
+			continue;
+		}
+		size = *(uint64_t *)(info + EFI_FILE_INFO_FILE_SIZE_OFFSET);
+		if (size == 0) {
+			file->close(file);
+			root->close(root);
+			continue;
+		}
+		bp = &block_shared.part[block_shared.parts];
+		memset(bp, 0, sizeof(*bp));
+		memcpy(bp->name, "apfsfile", 9);
+		bp->block_size = 4096;
+		bp->blocks = size / 4096 + (size % 4096 != 0);
+		bp->unit = 0xffff;
+		bp->lun = 0xff;
+		bp->flags = BLOCK_PART_FILE;
+		block_file = file;
+		block_file_root = root;
+		block_file_size = size;
+		block_shared.parts++;
+		print("ufs: system.apfs: %d bytes served as partition apfsfile (%d blocks of 4096), read only\n",
+		    size, bp->blocks);
+		added = 1;
+		break;
+	}
+	BS->free_pool(handles);
+	return added;
+}
+
 static void
 block_start(void)
 {
@@ -1908,6 +1996,16 @@ block_start(void)
 	} units[BLOCK_MAX_UNITS];
 	uint64_t nunits = 0;
 
+	/* this loader stays resident across runs: the file of the run before is closed here */
+	if (block_file != NULL) {
+		block_file->close(block_file);
+		block_file = NULL;
+	}
+	if (block_file_root != NULL) {
+		block_file_root->close(block_file_root);
+		block_file_root = NULL;
+	}
+	block_file_size = 0;
 	memset(&block_shared, 0, sizeof(block_shared));
 	block_tables();
 	/* the logical units: the block devices that are not partitions of another */
@@ -1931,8 +2029,10 @@ block_start(void)
 		BS->free_pool(handles);
 	}
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
-		print("ufs: no partition information: the block service is off\n");
-		return;
+		/* the file-backed part does not need the GPT walk; the units and it are still offered */
+		print("ufs: no partition information: only the file-backed part is offered\n");
+		handles = NULL;
+		count = 0;
 	}
 	for (uint64_t i = 0; i < count && block_shared.parts + nunits < BLOCK_MAX_PARTS; i++) {
 		struct loader_block_part *bp = &block_shared.part[block_shared.parts];
@@ -1989,6 +2089,8 @@ block_start(void)
 		bp->flags = BLOCK_PART_UNIT;
 		block_bios[block_shared.parts++] = units[u].bio;
 	}
+	/* system.apfs as a partition of its own: blocks from the file, not from the whole container in RAM */
+	block_add_file_part();
 	/* the kernel's own transfer list: this loader's area, if the controller is as UEFI keeps it */
 	if (hc_known && hc_list_is_uefis() && hc_rd(HC_UTRLDBR) == 0 && (hc_rd(HC_HCE) & 1)) {
 		memset(hc_area, 0, sizeof(hc_area));
@@ -2139,6 +2241,47 @@ block_poll(void)
 			}
 			s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
 			bytes = 0;
+		} else if (block_shared.part[part].flags & BLOCK_PART_FILE) {
+			/*
+			 * The file-backed partition: position the file at the block and read straight into the
+			 * kernel's buffer.  A read that stops at the end of the file is padded with zeroes (the
+			 * last block is a whole block); a write is never served.
+			 */
+			if (op != BLOCK_OP_READ || block_file == NULL) {
+				if (block_writes_refused++ < 8) {
+					print("ufs: a write/unknown op of %d blocks from %d of %s: REFUSED\n", count, lba,
+					    block_shared.part[part].name);
+				}
+				s = 0x800000000000000FULL;      /* EFI_ACCESS_DENIED */
+				bytes = 0;
+			} else {
+				efi_status (EFIAPI *set_position)(efi_file *, uint64_t) =
+				    (efi_status (EFIAPI *)(efi_file *, uint64_t))block_file->set_position;
+				uint64_t at = lba * block_shared.part[part].block_size, done = 0;
+
+				s = set_position == NULL ? 0x8000000000000002ULL : set_position(block_file, at);
+				while (!EFI_ERROR(s) && done < bytes) {
+					uint64_t n = bytes - done;
+
+					s = block_file->read(block_file, &n, block_buffer + done);
+					if (!EFI_ERROR(s) && n > bytes - done) {
+						s = 0x800000000000000AULL;      /* EFI_VOLUME_CORRUPTED */
+					}
+					if (EFI_ERROR(s) || n == 0) {
+						break;
+					}
+					done += n;
+				}
+				if (!EFI_ERROR(s) && done < bytes) {
+					if (at + done >= block_file_size) {
+						memset(block_buffer + done, 0, (size_t)(bytes - done));
+					} else {
+						s = 0x800000000000000AULL;      /* EFI_VOLUME_CORRUPTED */
+					}
+				}
+				flush_dcache((uint64_t)(uintptr_t)block_buffer,
+				    (uint64_t)(uintptr_t)block_buffer + bytes);
+			}
 		} else if (op == BLOCK_OP_WRITE) {
 			if (block_write_part < 0 || part != (uint32_t)block_write_part || lba < BLOCK_WRITE_FIRST) {
 				/* not darwin, or not past what the build writes from the computer: never */
@@ -2568,6 +2711,9 @@ parse_payload(struct payload_info *pi, int verbose)
 
 	memset(pi, 0, sizeof(*pi));
 	pi->cmdline = "";
+	if (!payload_readable) {
+		return 0;
+	}
 	if (ph->magic != PAYLOAD_MAGIC) {
 		print("no payload at %x (magic %x)\n", PAYLOAD_BASE, (uint64_t)ph->magic);
 		return 0;
@@ -2782,6 +2928,187 @@ choose_window(const struct payload_info *pi)
 }
 
 /*
+ * The full iOS APFS container does not fit in the small boot image. When a
+ * FAT volume is present (for example the A32 microSD card), copy it straight
+ * into the resident image slot in XNU's already-claimed RAM window. Reading
+ * directly into the final slot avoids needing a second multi-gigabyte buffer.
+ */
+static int
+load_resident_from_volume(void)
+{
+	static const efi_guid fs_guid = EFI_SIMPLE_FILE_SYSTEM_GUID, info_guid = EFI_FILE_INFO_GUID;
+	static const char16 path[] = u"\\EFI\\hakios\\system.apfs";
+	efi_handle *handles = NULL;
+	uint64_t count = 0;
+	efi_status status;
+	uint8_t info[512] __attribute__((aligned(8)));
+	uint64_t dest, size, info_size;
+
+	if (resident_rd_size != 0) {
+		return 1;
+	}
+	if (win_size <= RESIDENT_RD_OFFSET + RESIDENT_RD_RESERVE) {
+		print("microSD system: memory window leaves no resident image space\n");
+		return 0;
+	}
+	status = BS->locate_handle_buffer(ByProtocol, &fs_guid, NULL, &count, &handles);
+	if (EFI_ERROR(status) || handles == NULL) {
+		print("microSD system: no UEFI file-system volumes\n");
+		return 0;
+	}
+	dest = win_base + RESIDENT_RD_OFFSET;
+	for (uint64_t i = 0; i < count; i++) {
+		efi_simple_fs *fs = NULL;
+		efi_file *root = NULL, *file = NULL;
+		uint64_t done = 0;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &fs_guid, (void **)&fs)) || fs == NULL ||
+		    EFI_ERROR(fs->open_volume(fs, &root)) || root == NULL) {
+			continue;
+		}
+		if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
+			root->close(root);
+			continue;
+		}
+		info_size = sizeof(info);
+		if (EFI_ERROR(file->get_info(file, &info_guid, &info_size, info))) {
+			print("microSD system: file size could not be read\n");
+			goto close_volume;
+		}
+		size = *(uint64_t *)(info + EFI_FILE_INFO_FILE_SIZE_OFFSET);
+		if (size == 0 || size > win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE) {
+			print("microSD system: APFS image %x exceeds resident capacity %x\n", size,
+			    win_size - RESIDENT_RD_OFFSET - RESIDENT_RD_RESERVE);
+			goto close_volume;
+		}
+		while (done < size) {
+			uint64_t chunk = size - done < 0x100000ULL ? size - done : 0x100000ULL;
+
+			if (EFI_ERROR(file->read(file, &chunk, (void *)(uintptr_t)(dest + done))) || chunk == 0) {
+				print("microSD system: APFS read stopped at %x of %x bytes\n", done, size);
+				memset((void *)(uintptr_t)dest, 0, (size_t)(done < 4096 ? done : 4096));
+				goto close_volume;
+			}
+			done += chunk;
+		}
+		resident_rd_size = size;
+		print("microSD system: loaded %x bytes into resident RAM\n", size);
+		file->close(file);
+		root->close(root);
+		BS->free_pool(handles);
+		return 1;
+
+close_volume:
+		file->close(file);
+		root->close(root);
+	}
+	BS->free_pool(handles);
+	print("microSD system: \\\\EFI\\\\hakios\\\\system.apfs not found; using payload ramdisk only\n");
+	return 0;
+}
+
+/* A small, safe probe used before attempting to reserve several GiB for XNU. */
+static void
+probe_system_volume(void)
+{
+	static const efi_guid fs_guid = EFI_SIMPLE_FILE_SYSTEM_GUID, info_guid = EFI_FILE_INFO_GUID;
+	static const char16 path[] = u"\\EFI\\hakios\\system.apfs";
+	efi_handle *handles = NULL;
+	uint64_t count = 0;
+	efi_status status = BS->locate_handle_buffer(ByProtocol, &fs_guid, NULL, &count, &handles);
+
+	if (EFI_ERROR(status) || handles == NULL) {
+		print("microSD probe: no UEFI SimpleFS volumes\n");
+		return;
+	}
+	print("microSD probe: %d UEFI SimpleFS volume(s)\n", count);
+	for (uint64_t i = 0; i < count; i++) {
+		efi_simple_fs *fs = NULL;
+		efi_file *root = NULL, *file = NULL;
+		uint8_t info[512] __attribute__((aligned(8)));
+		uint8_t sample[64];
+		uint64_t info_size = sizeof(info), size;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &fs_guid, (void **)&fs)) || fs == NULL ||
+		    EFI_ERROR(fs->open_volume(fs, &root)) || root == NULL) {
+			continue;
+		}
+		if (EFI_ERROR(root->open(root, &file, path, EFI_FILE_MODE_READ, 0)) || file == NULL) {
+			root->close(root);
+			continue;
+		}
+		if (EFI_ERROR(file->get_info(file, &info_guid, &info_size, info))) {
+			print("microSD probe: system.apfs exists; size query failed\n");
+			file->close(file);
+			root->close(root);
+			continue;
+		}
+		size = *(uint64_t *)(info + EFI_FILE_INFO_FILE_SIZE_OFFSET);
+		uint64_t sample_size = sizeof(sample);
+		status = file->read(file, &sample_size, sample);
+	print("microSD probe: system.apfs size=%d first-read=%d APFS-NXSB=%d\n", size, sample_size,
+	    (uint64_t)(!EFI_ERROR(status) && sample_size == sizeof(sample) && memcmp(sample + 32, "NXSB", 4) == 0));
+		file->close(file);
+		root->close(root);
+		BS->free_pool(handles);
+		return;
+	}
+	BS->free_pool(handles);
+	print("microSD probe: system.apfs not found on any volume\n");
+}
+
+/* Give the A32 user one unmistakable signal when the EFI application itself starts. */
+static int
+a32_haptic_probe(void)
+{
+	static const efi_guid pmic_guid = MTK_PMIC_PROTOCOL_GUID;
+	efi_mtk_pmic *pmic = NULL;
+	uint8_t enabled = 0;
+	uint32_t voltage = 0;
+	efi_status status;
+
+	if (EFI_ERROR(BS->locate_protocol(&pmic_guid, NULL, (void **)&pmic)) || pmic == NULL ||
+	    pmic->regulator_set_enable == NULL || pmic->regulator_is_enabled == NULL ||
+	    pmic->regulator_set_voltage == NULL || pmic->regulator_get_voltage == NULL ||
+	    EFI_ERROR(pmic->regulator_is_enabled("ldo_vibr", &enabled)) ||
+	    EFI_ERROR(pmic->regulator_get_voltage("ldo_vibr", &voltage))) {
+		return 0;
+	}
+
+	/* The previous probe incorrectly treated an already-enabled rail as a
+	 * failed cue. Save its state, force a fresh edge, then restore it. */
+	status = pmic->regulator_set_enable("ldo_vibr", 0);
+	if (EFI_ERROR(status)) {
+		return 0;
+	}
+	status = pmic->regulator_set_voltage("ldo_vibr", 2800000);
+	if (EFI_ERROR(status)) {
+		pmic->regulator_set_enable("ldo_vibr", enabled);
+		return 0;
+	}
+	status = pmic->regulator_set_enable("ldo_vibr", 1);
+	if (EFI_ERROR(status)) {
+		pmic->regulator_set_voltage("ldo_vibr", voltage);
+		pmic->regulator_set_enable("ldo_vibr", enabled);
+		return 0;
+	}
+	BS->stall(120000);
+	pmic->regulator_set_enable("ldo_vibr", 0);
+	BS->stall(180000);
+	status = pmic->regulator_set_enable("ldo_vibr", 1);
+	if (EFI_ERROR(status)) {
+		pmic->regulator_set_voltage("ldo_vibr", voltage);
+		pmic->regulator_set_enable("ldo_vibr", enabled);
+		return 0;
+	}
+	BS->stall(360000);
+	pmic->regulator_set_enable("ldo_vibr", 0);
+	pmic->regulator_set_voltage("ldo_vibr", voltage);
+	pmic->regulator_set_enable("ldo_vibr", enabled);
+	return 1;
+}
+
+/*
  * Load and run the kernel from the payload. Returns when the kernel comes
  * back (panic, checkpoint, early exception); the combined log is staged and
  * written to the log partition. Returns 0 if the kernel could not be started.
@@ -2869,6 +3196,25 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	if (!choose_window(&pi)) {
 		return 0;
+	}
+	/*
+	 * root_apfs=: the iOS volume is served block by block from the file (block_add_file_part,
+	 * loader_block) and userland switch-roots onto it; the kernel's own root is the payload
+	 * ramdisk (md0).  Copying the same multi-GB file into the memory window as well is neither
+	 * needed nor possible, so the resident-load path is left out.
+	 */
+	{
+		int served_by_file = 0;
+
+		for (const char *c = pi.cmdline; *c; c++) {
+			if (starts_with(c, "root_apfs=") && (c == pi.cmdline || c[-1] == ' ')) {
+				served_by_file = 1;
+			}
+		}
+		if (PLAT == &platform_a32 && pi.resident_rd == 0 && !served_by_file &&
+		    checkpoint != CHECKPOINT_ENTRY) {
+			load_resident_from_volume();
+		}
 	}
 
 	uint64_t phys_base = win_base;
@@ -2984,6 +3330,14 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
 		    c[11] <= '9';
 	}
+	if (checkpoint == CHECKPOINT_SELFTEST) {
+		kernel_mpidr = this_mpidr;
+	}
+	/* The mailbox is serviced only by run_on_other_cpu's loader watch loop. */
+	if (ufs_requested >= 2 && kernel_mpidr == this_mpidr) {
+		print("storage: ufs=2 requires the kernel on a different CPU; handoff refused\n");
+		return 0;
+	}
 	if (battery_requested) {
 		charger_start();
 	}
@@ -2995,9 +3349,6 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	}
 	if (ufs_requested >= 2) {
 		block_start();
-	}
-	if (checkpoint == CHECKPOINT_SELFTEST) {
-		kernel_mpidr = this_mpidr;
 	}
 
 	/* where the kernel will show its signs of life, and how long it has said it will run */
@@ -4116,6 +4467,83 @@ ramfb_phone_screen(void)
 static uint64_t volume_payload_bytes;           /* 0: nothing was read; else the payload's size */
 static const char *volume_payload_note;         /* why not, if it was looked for */
 
+/* Bound duplicate checks and stack use for file-supplied entries, including
+ * unknown extension names. The host A32 verifier enforces the same limit. */
+#define VOLUME_PAYLOAD_MAX_ENTRIES 128u
+
+/* Validate a fully read file before either parser or banner can see it. */
+static int
+volume_payload_valid(const void *data, uint64_t bytes)
+{
+	const struct payload_header *h = data;
+	if (bytes < sizeof(*h) || bytes > PAYLOAD_MAX_SIZE - 0x100000ULL ||
+	    h->magic != PAYLOAD_MAGIC || h->size != bytes - sizeof(*h)) {
+		return 0;
+	}
+	const uint8_t *p = (const uint8_t *)(h + 1);
+	uint64_t left = bytes - sizeof(*h);
+	const char *names[VOLUME_PAYLOAD_MAX_ENTRIES];
+	unsigned count = 0;
+	while (left >= sizeof(struct payload_entry)) {
+		const struct payload_entry *e = (const struct payload_entry *)p;
+		p += sizeof(*e);
+		left -= sizeof(*e);
+		if (!e->name[0]) {
+			for (unsigned i = 1; i < sizeof(e->name); i++) {
+				if (e->name[i]) {
+					return 0;
+				}
+			}
+			return left == 0 && e->size == 0 && e->reserved == 0;
+		}
+		unsigned n = 0;
+		while (n < sizeof(e->name) && e->name[n]) {
+			if ((uint8_t)e->name[n] > 0x7f) {
+				return 0;
+			}
+			n++;
+		}
+		uint64_t padded = ((uint64_t)e->size + 15) & ~15ULL;
+		if (n == sizeof(e->name) || e->reserved || padded > left) {
+			return 0;
+		}
+		for (unsigned i = n + 1; i < sizeof(e->name); i++) {
+			if (e->name[i]) {
+				return 0;
+			}
+		}
+		if (count == VOLUME_PAYLOAD_MAX_ENTRIES) {
+			return 0;
+		}
+		for (unsigned i = 0; i < count; i++) {
+			if (str_eq(names[i], e->name)) {
+				return 0;
+			}
+		}
+		names[count++] = e->name;
+		for (uint64_t i = e->size; i < padded; i++) {
+			if (p[i]) {
+				return 0;
+			}
+		}
+		if (str_eq(e->name, "cmdline") || str_eq(e->name, "physbase") ||
+		    str_eq(e->name, "rdres") || str_eq(e->name, "kernel.ver") ||
+		    str_eq(e->name, "checkpoint") || str_eq(e->name, "platform") || str_eq(e->name, "usb")) {
+			if (!e->size || p[e->size - 1] != 0) {
+				return 0;
+			}
+			for (uint32_t i = 0; i < e->size - 1; i++) {
+				if (!p[i]) {
+					return 0;
+				}
+			}
+		}
+		p += padded;
+		left -= padded;
+	}
+	return 0;
+}
+
 static int
 load_payload_from_volume(void)
 {
@@ -4128,6 +4556,8 @@ load_payload_from_volume(void)
 	uint8_t info[512] __attribute__((aligned(8)));
 	uint64_t info_size = sizeof(info), size, done = 0, pages;
 	uint64_t address = PAYLOAD_BASE;
+	payload_readable = 0;
+	volume_payload_bytes = 0;
 
 	if (EFI_ERROR(BS->handle_protocol(IMAGE, &image_guid, (void **)&image)) || image == NULL || image->device == NULL ||
 	    EFI_ERROR(BS->handle_protocol(image->device, &fs_guid, (void **)&fs)) || fs == NULL) {
@@ -4143,7 +4573,8 @@ load_payload_from_volume(void)
 		root->close(root);
 		return 0;
 	}
-	if (EFI_ERROR(file->get_info(file, &info_guid, &info_size, info))) {
+	if (EFI_ERROR(file->get_info(file, &info_guid, &info_size, info)) ||
+	    info_size < EFI_FILE_INFO_FILE_SIZE_OFFSET + sizeof(uint64_t)) {
 		volume_payload_note = "the size of \\EFI\\hakios\\payload.bin cannot be read";
 		goto close;
 	}
@@ -4165,7 +4596,8 @@ load_payload_from_volume(void)
 	while (done < size) {
 		uint64_t chunk = size - done < 0x100000ULL ? size - done : 0x100000ULL;       /* 1 MiB at a time */
 
-		if (EFI_ERROR(file->read(file, &chunk, (void *)(uintptr_t)(PAYLOAD_BASE + done))) || chunk == 0) {
+		uint64_t requested = chunk;
+		if (EFI_ERROR(file->read(file, &chunk, (void *)(uintptr_t)(PAYLOAD_BASE + done))) || chunk == 0 || chunk > requested) {
 			volume_payload_note = "\\EFI\\hakios\\payload.bin could not be read to its end";
 			/* what was read stays in memory after the pages are given back: without this, the first MiB's XNUP
 			 * header would still be there and a half-read payload would be taken for a whole one */
@@ -4175,12 +4607,14 @@ load_payload_from_volume(void)
 		}
 		done += chunk;
 	}
-	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
-		volume_payload_note = "\\EFI\\hakios\\payload.bin is not a payload (no XNUP at its start)";
+	if (!volume_payload_valid((const void *)PAYLOAD_BASE, size)) {
+		volume_payload_note = "\\EFI\\hakios\\payload.bin has invalid headers, bounds or text";
+		((volatile struct payload_header *)PAYLOAD_BASE)->magic = 0;
 		BS->free_pages(PAYLOAD_BASE, pages);
 		goto close;
 	}
 	volume_payload_bytes = size;
+	payload_readable = 1;
 close:
 	file->close(file);
 	root->close(root);
@@ -4193,10 +4627,13 @@ close:
  * nothing and prints nothing, so that the banner can use it before the rest of the loader runs.
  */
 static const char *
-payload_kernel_version(void)
+payload_text_entry(const char *name)
 {
 	const struct payload_header *ph = (const struct payload_header *)PAYLOAD_BASE;
 
+	if (!payload_readable) {
+		return NULL;
+	}
 	if (ph->magic != PAYLOAD_MAGIC) {
 		return NULL;
 	}
@@ -4211,7 +4648,8 @@ payload_kernel_version(void)
 		if ((uint64_t)e->size > (uint64_t)(pend - (p + sizeof(*e)))) {
 			break;
 		}
-		if (str_eq(e->name, "kernel.ver")) {
+		if (str_eq(e->name, name) && e->size != 0 &&
+		    p[sizeof(*e) + e->size - 1] == 0) {
 			return (const char *)(p + sizeof(*e));
 		}
 		p += sizeof(*e) + ((e->size + 15) & ~15u);
@@ -4229,7 +4667,7 @@ payload_kernel_version(void)
 static void
 print_banner(void)
 {
-	const char *version = payload_kernel_version();
+	const char *version = payload_text_entry("kernel.ver");
 
 	print("\n");
 	print("   #   #   ###   #   #  #####   ###    ####\n");
@@ -4255,7 +4693,7 @@ efi_main(efi_handle image, efi_system_table *st)
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
 	/* no payload in memory (nobody put one there): the volume this loader came from may have one, as a UEFI boot loader's does */
-	if (((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
+	if (A32_VOLUME_FIRST || ((const struct payload_header *)PAYLOAD_BASE)->magic != PAYLOAD_MAGIC) {
 		load_payload_from_volume();
 	}
 	print("== XNULOADER v3 ==\n");
@@ -4269,7 +4707,17 @@ efi_main(efi_handle image, efi_system_table *st)
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);
 
-	PLAT = &platform_qemu_virt;
+	const char *requested_platform = payload_text_entry("platform");
+	if (A32_VOLUME_FIRST && (!requested_platform || !str_eq(requested_platform, "a32"))) {
+		print("A32 loader: no valid A32 volume payload; kernel handoff refused\n");
+		return 0x8000000000000001ULL; /* EFI_LOAD_ERROR; return to firmware */
+	}
+	if (requested_platform && !str_eq(requested_platform, "a32")) {
+		print("unsupported payload platform %s\n", requested_platform);
+		reboot();
+	}
+	PLAT = requested_platform ? &platform_a32 : &platform_qemu_virt;
+	int have_payload = parse_payload(&pi, 0);
 	if (EFI_ERROR(BS->locate_protocol(&gop_guid, NULL, (void **)&GOP)) || GOP->mode == NULL ||
 	    GOP->mode->info == NULL || GOP->mode->fb_base == 0) {
 		GOP = NULL;                     /* no display (QEMU without -device ramfb) */
@@ -4278,7 +4726,9 @@ efi_main(efi_handle image, efi_system_table *st)
 		SCREEN.width = GOP->mode->info->width;
 		SCREEN.height = GOP->mode->info->height;
 		SCREEN.stride = GOP->mode->info->pixels_per_scanline * 4;
-		if (SCREEN.base == 0xE1000000ULL) {
+		if (PLAT == &platform_a32) {
+			/* The A32 firmware owns the panel. Keep its GOP scanout. */
+		} else if (SCREEN.base == 0xE1000000ULL) {
 			PLAT = &platform_redwood;
 		} else {
 			ramfb_phone_screen();
@@ -4290,7 +4740,27 @@ efi_main(efi_handle image, efi_system_table *st)
 	install_exception_hook();
 	wdt_arm();
 
-	int have_payload = parse_payload(&pi, 0);
+	/* Hold before GOP validation so the probe distinguishes an early display gap from a boot-shim failure. */
+	if (have_payload && pi.checkpoint == CHECKPOINT_UEFI_HOLD && PLAT == &platform_a32) {
+		print("A32 diagnostic: UEFI loader reached\n");
+		print("A32 diagnostic: haptic cue %d\n", (uint64_t)a32_haptic_probe());
+		if (GOP == NULL) {
+			print("A32 diagnostic: GOP unavailable\n");
+		} else {
+			print("A32 diagnostic: GOP %d x %d at %x\n", (uint64_t)SCREEN.width,
+			    (uint64_t)SCREEN.height, SCREEN.base);
+		}
+		probe_system_volume();
+		print("A32 diagnostic hold: read the results above; force-restart to leave this screen.\n");
+		for (;;) {
+			wdt_pet();
+			BS->stall(1000000);
+		}
+	}
+	if (PLAT == &platform_a32 && GOP == NULL) {
+		print("a32: firmware GOP is required before kernel handoff\n");
+		reboot();
+	}
 	if (have_payload && pi.usb_mode && usb_start()) {
 		flush_log();
 		usb_command_loop();
@@ -4299,6 +4769,15 @@ efi_main(efi_handle image, efi_system_table *st)
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {
 		run_kernel(0, 0);
+		/* Keep the result visible on phones that have no loader USB transport. */
+		if ((pi.checkpoint == CHECKPOINT_SELFTEST || pi.checkpoint == CHECKPOINT_ENTRY) &&
+		    PLAT == &platform_a32) {
+			print("A32 diagnostic finished; result stays on screen for 120 seconds.\n");
+			for (unsigned i = 0; i < 120; i++) {
+				wdt_pet();
+				BS->stall(1000000);
+			}
+		}
 	}
 	reboot();
 	return 0;

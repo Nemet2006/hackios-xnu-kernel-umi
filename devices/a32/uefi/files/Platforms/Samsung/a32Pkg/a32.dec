@@ -1,0 +1,11 @@
+[Defines]
+  DEC_SPECIFICATION = 0x00010005
+  PACKAGE_NAME      = a32Pkg
+  PACKAGE_GUID      = e8146067-45bb-4938-bff7-025c1b4f7d8e
+  PACKAGE_VERSION   = 1.0
+
+[Includes]
+  Include
+
+[Guids]
+  gA32MemoryMapHobGuid = { 0x9d6a8f12, 0x723e, 0x4f91, { 0xa6, 0x22, 0x7b, 0x9e, 0xd5, 0x81, 0x40, 0xc3 } }

@@ -1,0 +1,38 @@
+[Defines]
+  INF_VERSION                    = 0x0001001B
+  BASE_NAME                      = A32BootMemoryDxe
+  FILE_GUID                      = 7C769D41-2B75-43BC-A98C-29336B197F4C
+  MODULE_TYPE                    = DXE_DRIVER
+  VERSION_STRING                 = 1.0
+  ENTRY_POINT                    = A32BootMemoryDxeEntry
+
+[Sources]
+  A32BootMemoryDxe.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+  SiliciumPkg/SiliciumPkg.dec
+
+[LibraryClasses]
+  BaseLib
+  BaseMemoryLib
+  DebugLib
+  DxeServicesTableLib
+  FdtLib
+  HobLib
+  UefiBootServicesTableLib
+  UefiDriverEntryPoint
+
+[Guids]
+  gSiliciumEntryArgHobGuid                      ## CONSUMES
+
+[Protocols]
+  gEfiBlockIoProtocolGuid                       ## PRODUCES
+  gEfiSimpleFileSystemProtocolGuid              ## SOMETIMES_CONSUMES
+  gEfiSdMmcPassThruProtocolGuid                 ## CONSUMES
+  gEfiDevicePathProtocolGuid                    ## PRODUCES
+  gEfiCpuArchProtocolGuid                       ## CONSUMES
+
+[Depex]
+  gEfiCpuArchProtocolGuid

@@ -1,0 +1,14 @@
+version = 1
+
+[boot]
+timeout = 1
+default = "a32-xnuloader"
+
+[ui]
+title = "HakiOS A32"
+
+[[entry]]
+id = "a32-xnuloader"
+title = "Start HakiOS XNU loader"
+type = "efi"
+path = "EFI/BOOT/BOOTAA64.EFI"

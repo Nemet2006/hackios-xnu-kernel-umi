@@ -1,0 +1,91 @@
+--- a/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/FrameBufferSerialPortLib.c
++++ b/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/FrameBufferSerialPortLib.c
+@@ -195,6 +195,12 @@
+   // Ignore everything after the Log froze
+   if (CurrentPosition->YPos == FB_FROZEN_YPOS) {
+     return;
++  }
++
++  // LK may leave arbitrary data in the cursor slot. Never use it as an offset.
++  if (CurrentPosition->XPos >= MaxPosition.XPos || CurrentPosition->YPos >= MaxPosition.YPos) {
++    CurrentPosition->XPos = 0;
++    CurrentPosition->YPos = 0;
+   }
+ 
+   // Skip Invalid ACSII Characters
+@@ -289,7 +295,7 @@
+   CONST volatile FB_HANDOFF *Handoff;
+ 
+   // Build-time Default
+-  mFbGeometry.Base       = (UINTN)FbBase + FixedPcdGet32 (PcdFrameBufferXOffset) * FB_BPP;
++  mFbGeometry.Base       = (UINTN)FbBase + (UINT64)FixedPcdGet32 (PcdFrameBufferXOffset) * FB_BPP;
+   mFbGeometry.Width      = FixedPcdGet32 (PcdFrameBufferWidth);
+   mFbGeometry.Height     = FixedPcdGet32 (PcdFrameBufferHeight);
+   mFbGeometry.PitchBytes = mFbGeometry.Width * FB_BPP;
+@@ -304,6 +310,32 @@
+   }
+ }
+ 
++STATIC
++BOOLEAN
++GeometryFitsRegion (
++  IN EFI_PHYSICAL_ADDRESS FbBase,
++  IN UINT64               FbLength)
++{
++  UINT64 Offset, Bytes;
++  UINT8 Scale;
++
++  if (FbLength < FB_HANDOFF_OFFSET || FbBase > MAX_UINT64 - FbLength ||
++      FB_BPP == 0 || FB_BPP > 4 || FB_WIDTH == 0 || FB_HEIGHT == 0 ||
++      (UINT64)FB_WIDTH * FB_BPP > FB_PITCH || mFbGeometry.Base < FbBase) {
++    return FALSE;
++  }
++  Offset = mFbGeometry.Base - FbBase;
++  Bytes = (UINT64)FB_PITCH * FB_HEIGHT;
++  // The handoff and cursor occupy the final bytes, outside pixel storage.
++  if (Offset > FbLength - FB_HANDOFF_OFFSET ||
++      Bytes > FbLength - FB_HANDOFF_OFFSET - Offset) {
++    return FALSE;
++  }
++  Scale = GetFontScale ();
++  return Scale != 0 && FB_WIDTH / ((FONT_WIDTH + 1) * Scale) != 0 &&
++         FB_HEIGHT / ((FONT_HEIGHT - 4) * Scale) != 0;
++}
++
+ UINTN
+ EFIAPI
+ SerialPortWrite (
+@@ -322,6 +354,9 @@
+ 
+   // Use the Geometry of the Frame Buffer that is really scanned out
+   LoadGeometry (FbBase, FbLength);
++  if (!GeometryFitsRegion (FbBase, FbLength)) {
++    return 0;
++  }
+ 
+   // Get Interrupts State
+   BOOLEAN InterruptState = ArmGetInterruptState ();
+--- a/Silicon/Silicium/SiliciumPkg/Drivers/SimpleFbDxe/SimpleFb.c
++++ b/Silicon/Silicium/SiliciumPkg/Drivers/SimpleFbDxe/SimpleFb.c
+@@ -123,8 +123,20 @@
+     return EFI_UNSUPPORTED;
+   }
+ 
++  // Keep pixel writes inside the reservation and away from debug metadata.
++  UINT64 BytesPerPixel = *ColorDepth / 8;
++  UINT64 Offset = (UINT64)FixedPcdGet32 (PcdFrameBufferXOffset) * BytesPerPixel;
++  UINT64 RowBytes = (UINT64)*Width * BytesPerPixel;
++  if ((*ColorDepth != 16 && *ColorDepth != 24 && *ColorDepth != 32) ||
++      FrameBufferRegion.Length < 0x40 || RowBytes > MAX_UINT32 ||
++      Offset > FrameBufferRegion.Length - 0x40 ||
++      *Height > (FrameBufferRegion.Length - 0x40 - Offset) / RowBytes ||
++      (UINT64)*Width * *Height > MAX_UINT32 / BytesPerPixel) {
++    return EFI_UNSUPPORTED;
++  }
++
+   // Pass Frame Buffer Address
+-  *BaseAddress = FrameBufferRegion.Address + FixedPcdGet32 (PcdFrameBufferXOffset) * (*ColorDepth / 8);
++  *BaseAddress = FrameBufferRegion.Address + Offset;
+ 
+   return EFI_SUCCESS;
+ }

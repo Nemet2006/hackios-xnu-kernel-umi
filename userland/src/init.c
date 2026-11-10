@@ -175,11 +175,12 @@ static void
 flash_root(const char *dev)
 {
 	static char buf[8192];
+	const char *appsdir;
 	char devpath[96], name[256], from[800], to[400];
 	struct stat fw_st;
 	off_t pos = 0;
 	ssize_t n;
-	int fd, ok, apps = 0, bound = 0;
+	int fd, ok, apps = 0, bound = 0, installed = 0;
 
 	printf("\n-- the iOS root volume on /dev/%s as the root --\n", dev);
 	strcpy(devpath, join("/dev/", dev, ""));
@@ -216,7 +217,20 @@ flash_root(const char *dev)
 		check(ok, "Sileo's programs in /bin, over the volume's own");
 	}
 
-	fd = open("/flash/private/var/staged_system_apps", O_RDONLY | O_DIRECTORY, 0);
+	/*
+	 * An image built for the RAM boot has the applications iOS installs on its first boot in
+	 * /Applications already (userland/build.sh moves them there, because /private/var is a
+	 * memory filesystem then), and an installed iOS volume has them still in
+	 * /private/var/staged_system_apps for their first boot to install.  Either way they have to
+	 * be visible in /Applications; only in the first case is there anything to name there.
+	 */
+	appsdir = "/flash/private/var/staged_system_apps";
+	fd = open(appsdir, O_RDONLY | O_DIRECTORY, 0);
+	if (fd < 0 && errno == ENOENT) {
+		appsdir = "/flash/Applications";
+		installed = 1;
+		fd = open(appsdir, O_RDONLY | O_DIRECTORY, 0);
+	}
 	while (fd >= 0 && (n = getdirentries(fd, buf, sizeof(buf), &pos)) > 0) {
 		for (char *p = buf; p < buf + n;) {
 			struct dirent *de = (struct dirent *)(void *)p;
@@ -232,6 +246,10 @@ flash_root(const char *dev)
 			memcpy(name, de->d_name, len);
 			name[len] = 0;
 			apps++;
+			if (installed) {
+				bound++;        /* it is in /Applications where it lies */
+				continue;
+			}
 			/* another name for it in /Applications, on the same volume: no mount point to skip */
 			strcpy(to, join("/flash/Applications/", name, "="));
 			strcpy(from, join(to, "/flash/private/var/staged_system_apps/", name));
@@ -243,7 +261,8 @@ flash_root(const char *dev)
 	if (fd >= 0) {
 		close(fd);
 	}
-	printf("  %d applications waiting to be installed, %d of them in /Applications\n", apps, bound);
+	printf("  %d applications %s, %d of them in /Applications\n",
+	    apps, installed ? "in /Applications" : "waiting to be installed", bound);
 	check(apps > 0 && bound == apps, "the first boot's applications in /Applications");
 
 	ok = sysctlbyname("kern.hakios_switch_root", NULL, NULL, "/flash private/preboot", 22) == 0;
@@ -265,7 +284,20 @@ flash_root(const char *dev)
 	 */
 	mount_cryptex("OS", ",c=1", devpath);
 	mount_cryptex("App", ",c=2", devpath);
-	check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
+	/*
+	 * This image, where it went with the switch: the boot volume itself when the kernel started
+	 * from it (there was no second RAM disk to mount this image from, so it is the boot volume
+	 * that is now /private/preboot), else the small image that was mounted on /redwood inside
+	 * the boot volume, which moves with it to /private/preboot/redwood.  Bound back on the
+	 * synthetic /redwood the volume has for it, where its launchd jobs are read and this
+	 * image's files (etc/rc, bin, ...) are found.
+	 */
+	if (base[0] == '\0') {
+		base = "/private/preboot";
+		check(bind_dir("/private/preboot", "/redwood"), "this image back on /redwood");
+	} else {
+		check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
+	}
 	flash_root_mode = 1;
 }
 
@@ -1222,8 +1254,15 @@ run_command(char *line)
 				close(null);
 			}
 		}
-		if (flash_root_mode && strcmp(argv[1], "/sbin/launchd.ios") == 0) {
-			argv[1] = "/sbin/launchd";      /* the root is iOS's own volume: its launchd is that */
+		/*
+		 * The root the switch-root chose has either a launchd.ios of its own (the system image
+		 * build.sh makes: its /sbin/launchd is stage0, the real launchd is launchd.ios) or,
+		 * as on a real iOS System volume, Apple's launchd at /sbin/launchd and no launchd.ios.
+		 * Only in the second case is the rc's "/sbin/launchd.ios" rewritten.
+		 */
+		if (flash_root_mode && strcmp(argv[1], "/sbin/launchd.ios") == 0 &&
+		    stat("/sbin/launchd.ios", &st) != 0) {
+			argv[1] = "/sbin/launchd";
 		}
 		execve(argv[1], argv + 1, envp);
 		printf("%s: %s\n", argv[1], strerror(errno));

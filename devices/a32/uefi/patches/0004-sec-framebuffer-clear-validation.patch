@@ -1,0 +1,33 @@
+--- a/Silicon/Silicium/SiliciumPkg/Sec/Sec.c
++++ b/Silicon/Silicium/SiliciumPkg/Sec/Sec.c
+@@ -59,16 +59,20 @@
+ VOID
+ ClearFrameBuffer (VOID)
+ {
+-  EFI_MEMORY_REGION_DESCRIPTOR FrameBufferRegion;
+-
+-  // Locate "Display Reserved" Memory Region
+-  LocateMemoryRegionByName ("Display Reserved", &FrameBufferRegion);
+-  LocateMemoryRegionByName ("Display_Reserved", &FrameBufferRegion);
+-
+-  // Clear Memory Region
+-  if (FrameBufferRegion.Address != 0 && FrameBufferRegion.Length != 0) {
+-    ZeroMem ((VOID *)FrameBufferRegion.Address, FrameBufferRegion.Length);
+-  }
++  EFI_MEMORY_REGION_DESCRIPTOR FrameBufferRegion = {0};
++  EFI_STATUS Status;
++
++  Status = LocateMemoryRegionByName ("Display Reserved", &FrameBufferRegion);
++  if (EFI_ERROR (Status)) {
++    Status = LocateMemoryRegionByName ("Display_Reserved", &FrameBufferRegion);
++  }
++  if (EFI_ERROR (Status) || FrameBufferRegion.Address == 0 ||
++      FrameBufferRegion.Length == 0 ||
++      FrameBufferRegion.Address > MAX_UINT64 - FrameBufferRegion.Length) {
++    return;
++  }
++
++  ZeroMem ((VOID *)FrameBufferRegion.Address, FrameBufferRegion.Length);
+ }
+ 
+ STATIC

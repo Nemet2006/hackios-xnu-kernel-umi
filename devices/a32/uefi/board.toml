@@ -1,0 +1,17 @@
+[board]
+name = "a32"
+kit = "a32"
+description = "Samsung Galaxy A32 4G SM-A325F"
+
+[firmware]
+config = "a32"
+
+[bootimg.image]
+header_version = 2
+base = 0x40078000
+kernel_offset = 0x8000
+ramdisk_offset = 0x07c08000
+tags_offset = 0x0bc08000
+pagesize = 2048
+cmdline = "bootopt=64S3,32N2,64N2 loop.max_part=7"
+dtb_offset = 0x0bc08000

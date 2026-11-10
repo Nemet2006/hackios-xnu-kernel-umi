@@ -1,0 +1,27 @@
+# SM-A325F A325FXXSCDXL2 stock boot header contract.
+# Packaging input for the A32 UEFI firmware volume. Diagnostic and loader
+# self-test images were flashed historically. Current device state is unverified;
+# no stock restore after the latest diagnostic flash is documented.
+
+[uefi_fd]
+base = 0x40080000
+size = 0x300000
+
+[boot_shim]
+requires_kernel_header = true
+
+[boot_image_kernel]
+kernel_compression = "gzip"
+append_dtb = false
+
+[boot_image]
+base = 0x40078000
+kernel_offset = 0x00008000
+ramdisk_offset = 0x07c08000
+tags_offset = 0x0bc08000
+dtb_offset = 0x0bc08000
+header_version = 2
+pagesize = 2048
+cmdline = "bootopt=64S3,32N2,64N2 loop.max_part=7"
+os_version = "12.0.0"
+os_patch_level = "2025-01"

@@ -1,0 +1,58 @@
+--- a/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/FrameBufferSerialPortLib.c
++++ b/Silicon/Silicium/SiliciumPkg/Library/FrameBufferSerialPortLib/FrameBufferSerialPortLib.c
+@@ -253,12 +253,23 @@
+   OUT EFI_PHYSICAL_ADDRESS *Base,
+   OUT UINT64               *Length)
+ {
+-  EFI_MEMORY_REGION_DESCRIPTOR FbRegion;
++  EFI_MEMORY_REGION_DESCRIPTOR FbRegion = {0};
++  EFI_STATUS Status;
+ 
+   // Locate "Display Reserved" Memory Region
+-  LocateMemoryRegionByName ("Display Reserved", &FbRegion);
+-  LocateMemoryRegionByName ("Display_Reserved", &FbRegion);
+-  if (!FbRegion.Address && !FbRegion.Length) {
++  Status = LocateMemoryRegionByName ("Display Reserved", &FbRegion);
++  if (EFI_ERROR (Status)) {
++    Status = LocateMemoryRegionByName ("Display_Reserved", &FbRegion);
++  }
++  if (EFI_ERROR (Status)) {
++    return EFI_NOT_FOUND;
++  }
++  if (!FbRegion.Address || !FbRegion.Length ||
++      FbRegion.Address > MAX_UINT64 - FbRegion.Length) {
++    return EFI_NOT_FOUND;
++  }
++
++  if (FbRegion.Length < FB_HANDOFF_OFFSET) {
+     return EFI_NOT_FOUND;
+   }
+ 
+--- a/Silicon/Silicium/SiliciumPkg/Drivers/SimpleFbDxe/SimpleFb.c
++++ b/Silicon/Silicium/SiliciumPkg/Drivers/SimpleFbDxe/SimpleFb.c
+@@ -91,14 +91,21 @@
+   OUT UINT32               *Height,
+   OUT UINT32               *ColorDepth)
+ {
+-  EFI_MEMORY_REGION_DESCRIPTOR FrameBufferRegion;
++  EFI_MEMORY_REGION_DESCRIPTOR FrameBufferRegion = {0};
++  EFI_STATUS Status;
+ 
+   // Locate "Display Reserved" Memory Region
+-  LocateMemoryRegionByName ("Display Reserved", &FrameBufferRegion);
+-  LocateMemoryRegionByName ("Display_Reserved", &FrameBufferRegion);
++  Status = LocateMemoryRegionByName ("Display Reserved", &FrameBufferRegion);
++  if (EFI_ERROR (Status)) {
++    Status = LocateMemoryRegionByName ("Display_Reserved", &FrameBufferRegion);
++  }
++  if (EFI_ERROR (Status)) {
++    return EFI_NOT_FOUND;
++  }
+ 
+   // Verify Frame Buffer Region
+-  if (!FrameBufferRegion.Address) {
++  if (!FrameBufferRegion.Address || !FrameBufferRegion.Length ||
++      FrameBufferRegion.Address > MAX_UINT64 - FrameBufferRegion.Length) {
+     DEBUG ((EFI_D_ERROR, "Failed to Locate \"Display Reserved\" Memory Region!\n"));
+     return EFI_NOT_FOUND;
+   }

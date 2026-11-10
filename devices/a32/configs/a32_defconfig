@@ -1,0 +1,4 @@
+# HakiOS defconfig for the Samsung Galaxy A32 4G (a32): the common kernel, the mt6768 family's facts, and this device's own.
+#include common_defconfig
+#include mt6768.config
+#include a32.config

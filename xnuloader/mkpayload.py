@@ -16,7 +16,8 @@ ap.add_argument('--cmdline', default='')
 ap.add_argument('--physbase', default='', help='hex: force XNU physical base (testing)')
 ap.add_argument('--usb', action='store_true', help='make the loader stay resident and take commands over USB')
 ap.add_argument('--rdres', default='', help='hex size of a root image already placed at the resident address (QEMU)')
-ap.add_argument('--checkpoint', default='', help='kernel checkpoint to stop at; 999 = loader self test')
+ap.add_argument('--checkpoint', default='', help='loader checkpoint: 998 = hold before XNU, 999 = loader self test')
+ap.add_argument('--platform', choices=('a32',), default='', help='explicit hardware platform for the loader')
 ap.add_argument('--kernel-version', default='',
                 help='the kernel.ver the loader prints under its banner (default: tools/kernel-version.py)')
 ap.add_argument('--no-version', action='store_true', help='no kernel.ver entry')
@@ -41,6 +42,8 @@ if args.usb:
     add('usb', b'1\0')
 if args.checkpoint:
     add('checkpoint', args.checkpoint.encode() + b'\0')
+if args.platform:
+    add('platform', args.platform.encode() + b'\0')
 # The version of the kernel in this payload, which the loader prints as "kernel.ver=" under its banner and
 # hands to the kernel as the boot-arg hakios_kver. A loader that does not know the entry skips it.
 if not args.no_version:

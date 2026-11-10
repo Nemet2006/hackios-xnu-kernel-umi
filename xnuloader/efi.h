@@ -202,6 +202,16 @@ typedef struct efi_simple_fs {
 	efi_status (EFIAPI *open_volume)(struct efi_simple_fs *self, efi_file **root);
 } efi_simple_fs;
 
+/* MediaTek PMIC regulator protocol: used only for a short, reversible A32 diagnostic haptic cue. */
+typedef struct {
+	void (EFIAPI *power_button_pressed)(uint8_t *pressed);
+	void (EFIAPI *home_button_pressed)(uint8_t *pressed);
+	efi_status (EFIAPI *regulator_set_enable)(const char *name, uint8_t enable);
+	efi_status (EFIAPI *regulator_is_enabled)(const char *name, uint8_t *enabled);
+	efi_status (EFIAPI *regulator_set_voltage)(const char *name, uint32_t voltage_uv);
+	efi_status (EFIAPI *regulator_get_voltage)(const char *name, uint32_t *voltage_uv);
+} efi_mtk_pmic;
+
 #define EFI_FILE_MODE_READ      1ULL
 /* EFI_FILE_INFO: a size, then the file's size at offset 8 (the rest -- times, attributes, the name -- is not read) */
 #define EFI_FILE_INFO_FILE_SIZE_OFFSET 8
@@ -291,6 +301,7 @@ typedef struct {
 #define EFI_LOADED_IMAGE_GUID   { 0x5b1b31a1, 0x9562, 0x11d2, { 0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
 #define EFI_SIMPLE_FILE_SYSTEM_GUID { 0x964e5b22, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
 #define EFI_FILE_INFO_GUID      { 0x09576e92, 0x6d3f, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
+#define MTK_PMIC_PROTOCOL_GUID  { 0xb6028a3a, 0x8a09, 0x428a, { 0x95, 0x33, 0x09, 0xab, 0x68, 0x8f, 0x40, 0x04 } }
 #define EFI_PARTITION_INFO_GUID { 0x8cf2f62c, 0xbc9b, 0x4821, { 0x80, 0x8d, 0xec, 0x9e, 0xc4, 0x21, 0xa1, 0xa0 } }
 #define QCOM_CHARGER_EX_GUID     { 0x6edc8a6d, 0x2663, 0x43cd, { 0x90, 0xff, 0x46, 0x21, 0xff, 0xd1, 0x0d, 0xf5 } }
 #define QCOM_CHARGER_GUID        { 0x21bfb78b, 0x02ea, 0x4ab7, { 0x99, 0x40, 0xb5, 0x8a, 0x2a, 0xd6, 0x58, 0x29 } }

@@ -1,0 +1,62 @@
+diff --git a/Silicon/Silicium/SiliciumPkg/Library/MemoryInitPeiLib/MemoryInitPei.c b/Silicon/Silicium/SiliciumPkg/Library/MemoryInitPeiLib/MemoryInitPei.c
+index 433b982..0d1d2e3 100644
+--- a/Silicon/Silicium/SiliciumPkg/Library/MemoryInitPeiLib/MemoryInitPei.c
++++ b/Silicon/Silicium/SiliciumPkg/Library/MemoryInitPeiLib/MemoryInitPei.c
+@@ -103,7 +103,8 @@ EFI_STATUS
+ EFIAPI
+ MemoryPeim (
+   IN EFI_PHYSICAL_ADDRESS UefiMemoryBase,
+-  IN UINT64               UefiMemorySize)
++  IN UINT64               UefiMemorySize,
++  IN EFI_PHYSICAL_ADDRESS EntryArg)
+ {
+   EFI_STATUS                    Status                                              = EFI_SUCCESS;
+   ARM_MEMORY_REGION_DESCRIPTOR  MemoryTable[MAX_ARM_MEMORY_REGION_DESCRIPTOR_COUNT] = {0};
+@@ -116,8 +117,18 @@ MemoryPeim (
+   // Show Entry Message
+   DEBUG ((EFI_D_WARN, "MMU In\r"));
+ 
+-  // Get Memory Map
+-  GetMemoryMap (&MemoryDescriptor, &MemoryDescriptorCount);
++  // Parse LK's final device tree before enabling the MMU.
++  if ((EntryArg >= 0x40000000ULL) && (EntryArg < 0x140000000ULL)) {
++    extern EFI_STATUS GetMemoryMapFromFdt (CONST VOID *, EFI_MEMORY_REGION_DESCRIPTOR **, UINT8 *);
++    Status = GetMemoryMapFromFdt ((CONST VOID *)(UINTN)EntryArg, &MemoryDescriptor, &MemoryDescriptorCount);
++    if (EFI_ERROR (Status)) {
++      DEBUG ((EFI_D_ERROR, "A32: LK FDT memory map rejected: %r\n", Status));
++      return Status;
++    }
++  } else {
++    DEBUG ((EFI_D_ERROR, "A32: x0 0x%lx is outside the expected DRAM range\n", EntryArg));
++    return EFI_INVALID_PARAMETER;
++  }
+ 
+   DEBUG ((EFI_D_WARN, "MMU: %u regions\n", (UINT32)MemoryDescriptorCount));
+ 
+diff --git a/Silicon/Silicium/SiliciumPkg/Sec/Sec.c b/Silicon/Silicium/SiliciumPkg/Sec/Sec.c
+index 1b75d59..f4b05c9 100644
+--- a/Silicon/Silicium/SiliciumPkg/Sec/Sec.c
++++ b/Silicon/Silicium/SiliciumPkg/Sec/Sec.c
+@@ -113,7 +113,7 @@ InitializeMemory (VOID)
+   PrePeiSetHobList (HobList);
+ 
+   // Initialize MMU & Memory HOBs
+-  Status = MemoryPeim (UefiMemoryBase, UefiMemorySize);
++  Status = MemoryPeim (UefiMemoryBase, UefiMemorySize, gSecEntryArg0);
+   if (EFI_ERROR (Status)) {
+     return Status;
+   }
+diff --git a/Silicon/Silicium/SiliciumPkg/Sec/Sec.h b/Silicon/Silicium/SiliciumPkg/Sec/Sec.h
+index 092bda0..76d5926 100644
+--- a/Silicon/Silicium/SiliciumPkg/Sec/Sec.h
++++ b/Silicon/Silicium/SiliciumPkg/Sec/Sec.h
+@@ -19,7 +19,8 @@ EFI_STATUS
+ EFIAPI
+ MemoryPeim (
+   IN EFI_PHYSICAL_ADDRESS  UefiMemoryBase,
+-  IN UINT64                UefiMemorySize
++  IN UINT64                UefiMemorySize,
++  IN EFI_PHYSICAL_ADDRESS  EntryArg
+   );
+ 
+ EFI_STATUS
