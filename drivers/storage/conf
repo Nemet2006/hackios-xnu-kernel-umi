@@ -5,6 +5,9 @@
 standard bsd/dev/hakios.image.c
 	help    a file of one of the RAM disks by path, for the drivers that load firmware before there is a root
 
+standard bsd/dev/hakios.gpt_apfs.c
+	help    transport-independent read-only GPT partition lookup and APFS container length validation
+
 standard bsd/dev/hakios.sparse.c
 	help    /dev/rsp0, a block device over an image that holds only some of its blocks (apfs_sparse=)
 
