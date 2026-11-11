@@ -8,6 +8,9 @@ standard bsd/dev/hakios.image.c
 standard bsd/dev/hakios.gpt_apfs.c
 	help    transport-independent read-only GPT partition lookup and APFS container length validation
 
+standard bsd/dev/hakios.readonly_block.c
+	help    bounds, chunking and partial-sector reads shared by read-only block transports
+
 standard bsd/dev/hakios.sparse.c
 	help    /dev/rsp0, a block device over an image that holds only some of its blocks (apfs_sparse=)
 
