@@ -4,7 +4,10 @@
 #  - drops flags only Apple's clang understands
 #  - links with the cctools ld64
 HB="$(cd "$(dirname "$0")" && pwd)"
-case "$(basename "$0")" in *++) drv=clang++; extra=(-fno-use-cxa-atexit);; *) drv=clang; extra=();; esac
+case "$(basename "$0")" in
+  *++) drv=${XNU_CLANGXX:-clang++}; extra=(-fno-use-cxa-atexit);;
+  *) drv=${XNU_CLANG:-clang}; extra=();;
+esac
 args=()
 for a in "$@"; do
   case "$a" in
@@ -14,5 +17,5 @@ for a in "$@"; do
     *) args+=("$a");;
   esac
 done
-exec /usr/bin/$drv -include "$HB/../../hostinc/xnu_clang_compat.h" -target arm64-apple-ios${XNU_SDK_VERSION:-16.5} --ld-path="$HB/ld64" \
+exec "$drv" -include "$HB/../../hostinc/xnu_clang_compat.h" -target arm64-apple-ios${XNU_SDK_VERSION:-16.5} --ld-path="$HB/ld64" \
   -w "${extra[@]}" "${args[@]}"
