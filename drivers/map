@@ -21,6 +21,7 @@ storage  bsd/dev/hakios.sparse.c
 storage  bsd/dev/hakios.image.c
 storage  bsd/dev/hakios.gpt_apfs.c
 storage  bsd/dev/hakios.readonly_block.c
+storage  bsd/dev/hakios.readonly_scan.c
 storage  bsd/dev/hakios.apfs_check.c
 storage  bsd/dev/hakios.virtio_blk.c
 

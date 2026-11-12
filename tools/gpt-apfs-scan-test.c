@@ -5,6 +5,8 @@
 #include <string.h>
 
 #include "../xnu/files/bsd/sys/hakios.gpt_apfs.h"
+#include "../xnu/files/bsd/sys/hakios.readonly_block.h"
+#include "../xnu/files/bsd/sys/hakios.readonly_scan.h"
 
 #define SECTOR 512u
 #define BLOCKS 256u
@@ -17,6 +19,7 @@
 static uint8_t disk[BLOCKS * SECTOR];
 static uint8_t scratch[4096];
 static int reads;
+static uint32_t largest_read;
 
 static uint32_t
 crc32_bytes(const void *data, size_t size)
@@ -49,6 +52,7 @@ read_blocks(void *context, uint64_t lba, uint32_t blocks, void *destination)
 {
 	(void)context;
 	reads++;
+	if (blocks > largest_read) largest_read = blocks;
 	if (lba > BLOCKS || blocks > BLOCKS - lba) return -1;
 	memcpy(destination, disk + lba * SECTOR, (size_t)blocks * SECTOR);
 	return 0;
@@ -92,6 +96,7 @@ make_valid(void)
 	put64(nx + 40, 16); /* 64 KiB: the minimum accepted APFS container */
 	finish_crcs();
 	reads = 0;
+	largest_read = 0;
 }
 
 static int
@@ -163,6 +168,19 @@ main(void)
 	    tight, ENTRY_COUNT * ENTRY_SIZE, &result) == HAKIOS_GPT_APFS_SCRATCH);
 	free(tight);
 
-	puts("PASS: GPT CRC, bounds, partition lookup, and APFS length scan");
+	make_valid();
+	struct hakios_readonly_media readonly = {
+		.block_size = SECTOR,
+		.block_count = BLOCKS,
+		.max_transfer_blocks = 1,
+		.read_blocks = read_blocks,
+		.context = NULL,
+	};
+	assert(hakios_readonly_gpt_apfs_scan(&readonly, "xnusys", scratch,
+	    sizeof(scratch), &result) == HAKIOS_GPT_APFS_OK);
+	assert(result.first_lba == PART_FIRST && result.apfs_blocks == 128);
+	assert(largest_read == 1);
+
+	puts("PASS: GPT CRC, bounds, partition lookup, APFS length scan, and read-only bridge");
 	return 0;
 }

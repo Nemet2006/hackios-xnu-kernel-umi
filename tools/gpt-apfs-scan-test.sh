@@ -9,5 +9,6 @@ ${CC:-cc} -std=c11 -O1 -g -Wall -Wextra -Werror \
   -fsanitize=address,undefined -fno-sanitize-recover=all \
   -Ixnu/files/bsd \
   tools/gpt-apfs-scan-test.c drivers/storage/hakios.gpt_apfs.c \
+  drivers/storage/hakios.readonly_block.c drivers/storage/hakios.readonly_scan.c \
   -o "$tmp/gpt-apfs-scan-test"
 "$tmp/gpt-apfs-scan-test"
